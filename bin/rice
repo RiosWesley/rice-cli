@@ -259,7 +259,7 @@ def cmd_wrap(args):
         print("\033[1;31mError:\033[0m No installation command specified. Example: rice wrap --name myrice ./install.sh")
         return 1
 
-    print(f"\033[1;36m=== [rice wrap] Starting Sandboxed Rice Installer for '{profile_name}' ===\033[0m")
+    print(f"\033[1;36m=== [rice wrap] Sandboxed Rice Installer for '{profile_name}' ===\033[0m")
     
     # 1. Create automatic baseline snapshot
     desc = f"pre-rice-wrap-{profile_name}"
@@ -271,35 +271,37 @@ def cmd_wrap(args):
     target_profile_dir = PROFILES_DIR / profile_name
     target_profile_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Execute with filesystem redirection protection
-    # We use bwrap (Bubblewrap) if available to sandbox user config destination
-    has_bwrap = shutil.which("bwrap") is not None
-    print(f"2. Preparing sandbox environment (Bubblewrap: {'Available' if has_bwrap else 'Fallback Mode'})...")
+    # 3. Transparent Symlink Redirection (Allows real sudo without Bubblewrap PR_SET_NO_NEW_PRIVS)
+    print(f"2. Setting up Transparent Filesystem Isolation for '{profile_name}'...")
+    
+    # Save active link target if exists
+    orig_target = None
+    if ACTIVE_LINK.is_symlink():
+        orig_target = os.readlink(ACTIVE_LINK)
+
+    # Point active hyprland.lua to the target profile during installer execution
+    if ACTIVE_LINK.is_symlink() or ACTIVE_LINK.exists():
+        ACTIVE_LINK.unlink()
+    rel_profile_lua = os.path.relpath(target_profile_dir / "hyprland.lua", HYPR_DIR)
+    ACTIVE_LINK.symlink_to(rel_profile_lua)
 
     env = os.environ.copy()
     env["RICE_PROFILE"] = profile_name
 
     cmd_str = " ".join(command)
-    print(f"3. Executing installer: '\033[1m{cmd_str}\033[0m'...")
-    
-    # If bubblewrap is available, bind-mount target_profile_dir over ~/.config/hypr for the child
-    if has_bwrap and not args.no_sandbox:
-        bwrap_cmd = [
-            "bwrap",
-            "--dev-bind", "/", "/",
-            "--bind", str(target_profile_dir), str(HYPR_DIR),
-            "--setenv", "RICE_PROFILE", profile_name,
-            "/bin/bash", "-c", cmd_str
-        ]
-        ret = subprocess.call(bwrap_cmd)
-    else:
-        ret = subprocess.call(cmd_str, shell=True, env=env)
+    print(f"3. Executing installer: '\033[1m{cmd_str}\033[0m'...\n")
+    ret = subprocess.call(cmd_str, shell=True, env=env)
 
-    # 4. Post-install validation & integration
+    # 4. Restore original active link if user was not intending to switch immediately
+    if orig_target:
+        if ACTIVE_LINK.is_symlink() or ACTIVE_LINK.exists():
+            ACTIVE_LINK.unlink()
+        ACTIVE_LINK.symlink_to(orig_target)
+
+    # 5. Post-installation integration
     print(f"\n4. Post-installation integration for '{profile_name}'...")
     profile_lua = target_profile_dir / "hyprland.lua"
     if not profile_lua.exists():
-        # Look for hyprland.conf or generated entry
         conf_cand = target_profile_dir / "hyprland.conf"
         if conf_cand.exists():
             print("• Converting legacy hyprland.conf into modular Lua profile wrapper...")
@@ -311,7 +313,6 @@ def cmd_wrap(args):
                 f.write('require("shared.rules")\n')
                 f.write(f'hl.exec_cmd("hyprctl reload")\n')
 
-    # 5. Generate session wrapper and desktop entry
     bin_script = HOME / ".local" / "bin" / f"hypr-{profile_name}"
     desktop_entry = HOME / ".local" / "share" / "wayland-sessions" / f"hyprland-{profile_name}.desktop"
     
@@ -383,7 +384,6 @@ def main():
     # wrap
     p_wrap = subparsers.add_parser("wrap", help="Run a foreign rice installer in a protected sandbox")
     p_wrap.add_argument("--name", required=True, help="Name for the new profile (e.g. cyberarch, hyprcraft)")
-    p_wrap.add_argument("--no-sandbox", action="store_true", help="Disable bubblewrap filesystem redirection")
     p_wrap.add_argument("command", nargs=argparse.REMAINDER, help="Installer command to run (e.g. ./install.sh)")
     p_wrap.set_defaults(func=cmd_wrap)
 
