@@ -147,9 +147,47 @@ def cmd_snapshot(args):
         if ret == 0:
             print("\033[1;32mSnapshot created successfully via sudo.\033[0m")
         else:
-            print("\033[1;31mFailed to create snapshot.\033[0m")
+            print(f"\033[1;31mFailed to create snapshot.\033[0m")
     else:
-        print("\033[1;32mSnapshot created successfully.\033[0m")
+        print(f"\033[1;32mSnapshot created successfully.\033[0m")
+
+def cmd_restore(args):
+    print("\033[1;36m[rice restore] Starting configuration rollback...\033[0m")
+    chezmoi = str(CHEZMOI_BIN)
+
+    # 1. Reset working tree if dirty git state in chezmoi
+    if CHEZMOI_DIR.exists():
+        run_cmd(f"git -C {CHEZMOI_DIR} reset --hard HEAD")
+
+    # 2. Force apply chezmoi to overwrite any modifications made by external rices
+    print("• Restoring tracked dotfiles from chezmoi repository (force overwrite)...")
+    rc, out, err = run_cmd(f"{chezmoi} apply --force")
+    if rc != 0:
+        print(f"\033[1;31mError during chezmoi apply:\033[0m {err or out}")
+    else:
+        print("  \033[1;32m✓\033[0m Dotfiles restored successfully.")
+
+    # 3. Ensure hyprland.lua active symlink is restored
+    target_profile = args.profile or "end4"
+    target_lua = PROFILES_DIR / target_profile / "hyprland.lua"
+    if target_lua.exists():
+        rel_target = os.path.relpath(target_lua, HYPR_DIR)
+        if ACTIVE_LINK.is_symlink() or ACTIVE_LINK.exists():
+            ACTIVE_LINK.unlink()
+        ACTIVE_LINK.symlink_to(rel_target)
+        print(f"  \033[1;32m✓\033[0m Active Hyprland entry symlinked to profile '{target_profile}'.")
+
+    # 4. Live reload compositor if running
+    print("• Reloading Hyprland...")
+    rc, _, _ = run_cmd("hyprctl reload")
+    if rc == 0:
+        print("  \033[1;32m✓\033[0m Hyprland reloaded.")
+    else:
+        print("  \033[1;33m⚠\033[0m Hyprland is not currently running or reload failed.")
+
+    print("\n\033[1;32mRollback completed!\033[0m Your dotfiles and desktop profile have been restored.")
+    print("Note: If the foreign rice installed system packages or broke /etc, you can also roll back the system root snapshot using:")
+    print("  \033[1msnapper -c root list\033[0m  ->  \033[1msudo snapper -c root undochange <SNAPSHOT_NUM>..0\033[0m")
 
 def main():
     parser = argparse.ArgumentParser(
@@ -184,6 +222,11 @@ def main():
     p_snap = subparsers.add_parser("snapshot", help="Create a Snapper root snapshot")
     p_snap.add_argument("description", help="Snapshot description")
     p_snap.set_defaults(func=cmd_snapshot)
+
+    # restore
+    p_rest = subparsers.add_parser("restore", help="Roll back and restore clean saved state after testing another rice")
+    p_rest.add_argument("--profile", default="end4", help="Profile to activate after restore (default: end4)")
+    p_rest.set_defaults(func=cmd_restore)
 
     args = parser.parse_args()
     return args.func(args)
