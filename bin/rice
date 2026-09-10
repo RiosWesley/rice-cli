@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+rice - Declarative Rice & Reproducibility Orchestrator
+Automates multi-profile Hyprland ricing, declarative dotfiles/manifests via chezmoi,
+and BTRFS root disaster recovery via Snapper.
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+from pathlib import Path
+
+HOME = Path.home()
+HYPR_DIR = HOME / ".config" / "hypr"
+PROFILES_DIR = HYPR_DIR / "profiles"
+SHARED_DIR = HYPR_DIR / "shared"
+ACTIVE_LINK = HYPR_DIR / "hyprland.lua"
+CHEZMOI_DIR = HOME / ".local" / "share" / "chezmoi"
+MANIFESTS_DIR = CHEZMOI_DIR / "manifests"
+
+CHEZMOI_BIN = Path(os.getenv("CHEZMOI_BIN", str(HOME / ".local" / "bin" / "chezmoi")))
+if not CHEZMOI_BIN.exists():
+    CHEZMOI_BIN = Path("chezmoi")
+
+def run_cmd(cmd, capture=True, check=False):
+    try:
+        res = subprocess.run(
+            cmd,
+            shell=True,
+            text=True,
+            capture_output=capture,
+            check=check
+        )
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+    except subprocess.CalledProcessError as e:
+        return e.returncode, (e.stdout or "").strip(), (e.stderr or "").strip()
+
+def get_active_profile():
+    if ACTIVE_LINK.is_symlink():
+        target = os.readlink(ACTIVE_LINK)
+        parts = Path(target).parts
+        if "profiles" in parts:
+            idx = parts.index("profiles")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+        return Path(target).name
+    elif ACTIVE_LINK.exists():
+        return "custom/direct"
+    return "unknown"
+
+def cmd_status(args):
+    print("=== Rice Environment Status ===")
+    active = get_active_profile()
+    print(f"• Active Profile   : \033[1;32m{active}\033[0m")
+    
+    # Packages count
+    rc, pkg_count, _ = run_cmd("pacman -Q 2>/dev/null | wc -l")
+    if rc == 0 and pkg_count:
+        print(f"• Packages (total) : {pkg_count}")
+    
+    # Snapper last snapshot
+    rc, snap_out, _ = run_cmd("snapper -c root list 2>&1")
+    if rc == 0:
+        lines = [l for l in snap_out.splitlines() if l.strip()]
+        last_snap = lines[-1] if lines else "None"
+        print(f"• Snapper Root     : {last_snap}")
+    else:
+        print(f"• Snapper Root     : Permission required (run setup script if pending)")
+
+    # Chezmoi status
+    if CHEZMOI_DIR.exists():
+        rc, git_status, _ = run_cmd(f"git -C {CHEZMOI_DIR} status --short")
+        rc_log, last_commit, _ = run_cmd(f"git -C {CHEZMOI_DIR} log -1 --oneline")
+        print(f"• Chezmoi Commit   : {last_commit if rc_log == 0 else 'None'}")
+        if git_status:
+            print("• Chezmoi Changes  : \033[1;33mUncommitted changes present\033[0m")
+        else:
+            print("• Chezmoi Changes  : \033[1;32mClean\033[0m")
+    else:
+        print(f"• Chezmoi          : Not initialized")
+
+def cmd_list(args):
+    print("=== Available Profiles ===")
+    if not PROFILES_DIR.exists():
+        print(f"No profiles directory found at {PROFILES_DIR}")
+        return
+    
+    active = get_active_profile()
+    profiles = [p.name for p in PROFILES_DIR.iterdir() if p.is_dir() and (p / "hyprland.lua").exists()]
+    profiles.sort()
+    for p in profiles:
+        indicator = "\033[1;32m* (active)\033[0m" if p == active else "  "
+        print(f" {indicator} {p}")
+
+def cmd_switch(args):
+    target = args.profile
+    target_lua = PROFILES_DIR / target / "hyprland.lua"
+    if not target_lua.exists():
+        print(f"\033[1;31mError:\033[0m Profile '{target}' does not exist at {target_lua}")
+        return 1
+
+    rel_target = os.path.relpath(target_lua, HYPR_DIR)
+    if ACTIVE_LINK.is_symlink() or ACTIVE_LINK.exists():
+        ACTIVE_LINK.unlink()
+    ACTIVE_LINK.symlink_to(rel_target)
+    print(f"\033[1;32mSuccess:\033[0m Switched active symlink to profile '\033[1m{target}\033[0m'.")
+    print("\nNote:")
+    print(" • For full daemon/shell reloads: Logout and select the session in your Display Manager.")
+    print(" • Or perform a live compositor reload: \033[1mhyprctl reload\033[0m")
+    print(" • To exit current Hyprland session: \033[1mhyprctl dispatch exit\033[0m")
+
+def cmd_diff(args):
+    chezmoi = str(CHEZMOI_BIN)
+    os.system(f"{chezmoi} diff")
+
+def cmd_save(args):
+    msg = args.message
+    print("1. Updating software manifests...")
+    MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
+    run_cmd(f"pacman -Qqe > {MANIFESTS_DIR / 'packages.txt'}")
+    run_cmd(f"pacman -Qqem > {MANIFESTS_DIR / 'aur-packages.txt'}")
+    run_cmd(f"{{ systemctl --user list-unit-files --state=enabled --no-legend 2>/dev/null | awk '{{print $1}}' || true; systemctl list-unit-files --state=enabled --no-legend 2>/dev/null | awk '{{print $1}}' || true; }} > {MANIFESTS_DIR / 'services.txt'}")
+    
+    print("2. Syncing dotfiles to chezmoi...")
+    chezmoi = str(CHEZMOI_BIN)
+    run_cmd(f"{chezmoi} add ~/.config/fish ~/.config/kitty ~/.config/hypr ~/.config/quickshell 2>/dev/null || true")
+    
+    print("3. Committing to chezmoi repository...")
+    run_cmd(f"git -C {CHEZMOI_DIR} add .")
+    rc, out, err = run_cmd(f"git -C {CHEZMOI_DIR} commit -m {subprocess.list2cmdline([msg])}")
+    if rc == 0:
+        print(f"\033[1;32mSaved successfully:\033[0m {out.splitlines()[0] if out else ''}")
+    else:
+        if "nothing to commit" in out or "nothing to commit" in err:
+            print("\033[1;33mNotice:\033[0m No configuration changes to commit.")
+        else:
+            print(f"\033[1;31mGit error:\033[0m {err or out}")
+
+def cmd_snapshot(args):
+    desc = args.description
+    print(f"Creating root snapshot: '{desc}'...")
+    rc, out, err = run_cmd(f"snapper -c root create -d {subprocess.list2cmdline([desc])}")
+    if rc != 0:
+        print("\033[1;33mNormal user permission denied, trying with sudo...\033[0m")
+        ret = os.system(f"sudo snapper -c root create -d {subprocess.list2cmdline([desc])}")
+        if ret == 0:
+            print("\033[1;32mSnapshot created successfully via sudo.\033[0m")
+        else:
+            print("\033[1;31mFailed to create snapshot.\033[0m")
+    else:
+        print("\033[1;32mSnapshot created successfully.\033[0m")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="rice",
+        description="Rice & Reproducibility Orchestrator (Hyprland + Snapper + chezmoi)"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # status
+    p_status = subparsers.add_parser("status", help="Show environment, profiles, chezmoi and snapshot status")
+    p_status.set_defaults(func=cmd_status)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List available desktop profiles")
+    p_list.set_defaults(func=cmd_list)
+
+    # switch
+    p_switch = subparsers.add_parser("switch", help="Switch Hyprland active profile")
+    p_switch.add_argument("profile", help="Profile name (e.g. end4, vanilla, cyberarch)")
+    p_switch.set_defaults(func=cmd_switch)
+
+    # diff
+    p_diff = subparsers.add_parser("diff", help="Show diff between live dotfiles and chezmoi")
+    p_diff.set_defaults(func=cmd_diff)
+
+    # save
+    p_save = subparsers.add_parser("save", help="Dump manifests, add dotfiles and commit changes")
+    p_save.add_argument("message", help="Commit message")
+    p_save.set_defaults(func=cmd_save)
+
+    # snapshot
+    p_snap = subparsers.add_parser("snapshot", help="Create a Snapper root snapshot")
+    p_snap.add_argument("description", help="Snapshot description")
+    p_snap.set_defaults(func=cmd_snapshot)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
